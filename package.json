@@ -1,0 +1,13 @@
+{
+  "name": "inventaire-cis-rappel-notifications",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Rappel programmé (hors application) pour l'appli Inventaire CIS Saint-Raphaël : envoie une notification push au SOJ/Chef de Garde si des problèmes ou inventaires du jour restent à traiter.",
+  "main": "send-reminder.js",
+  "scripts": {
+    "start": "node send-reminder.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.0.0"
+  }
+}
