@@ -134,7 +134,7 @@ async function main() {
 
   const uidSet = new Set(sojUsers.map((u) => u.uid));
   const tokensSnap = await db.collection("fcm_tokens").get();
-  const tokens = tokensSnap.docs.filter((d) => uidSet.has(d.id)).map((d) => d.data().token).filter(Boolean);
+  const tokens = tokensSnap.docs.filter((d) => uidSet.has(d.data().uid)).map((d) => d.data().token).filter(Boolean);
 
   if (tokens.length === 0) {
     console.log("Aucun compte SOJ/Chef de Garde n'a activé les notifications pour l'instant.");
