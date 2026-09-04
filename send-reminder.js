@@ -60,12 +60,13 @@ function isScheduledToday(vehicle, weekday) {
 
 // Calcule s'il faut prévenir, à partir des mêmes données que le bandeau dans l'application.
 // Fonction pure (aucun accès réseau) pour pouvoir être testée facilement.
-function computeShouldNotify({ now, horaires, vehicles, checksToday }) {
+function computeShouldNotify({ now, horaires, vehicles, checksToday, missedToday }) {
   if (!isAtOrAfter(now, horaires.bandeau, 17, 0)) return { shouldNotify: false, reason: "avant l'heure du bandeau" };
 
   const hasUnvalidatedProblemsToday = checksToday.some((c) =>
-    Object.values(c.results || {}).some((r) => r.manquant || r.deteriore)
+    Object.values(c.results || {}).some((r) => (r.manquant || r.deteriore) && !r.validated)
   );
+  const hasUnvalidatedMissedToday = (missedToday || []).some((m) => !m.validated);
   const hasPendingDayInventory = vehicles.some((v) =>
     isScheduledToday(v, now.weekday) && !v.indisponible &&
     !checksToday.some((c) => c.vehicleId === v.id)
@@ -75,8 +76,8 @@ function computeShouldNotify({ now, horaires, vehicles, checksToday }) {
     !checksToday.some((c) => c.vehicleId === v.id && isEveningCheckIso(c.date, horaires))
   );
 
-  const shouldNotify = hasUnvalidatedProblemsToday || hasPendingDayInventory || hasPendingEveningInventory;
-  return { shouldNotify, hasUnvalidatedProblemsToday, hasPendingDayInventory, hasPendingEveningInventory };
+  const shouldNotify = hasUnvalidatedProblemsToday || hasUnvalidatedMissedToday || hasPendingDayInventory || hasPendingEveningInventory;
+  return { shouldNotify, hasUnvalidatedProblemsToday, hasUnvalidatedMissedToday, hasPendingDayInventory, hasPendingEveningInventory };
 }
 
 async function main() {
@@ -96,12 +97,6 @@ async function main() {
     return;
   }
 
-  const validationSnap = await db.collection("validations").doc(now.dayKey).get();
-  if (validationSnap.exists) {
-    console.log("Journée déjà prise en compte, rien à envoyer.");
-    return;
-  }
-
   const usersSnap = await db.collection("caserne").doc("users").get();
   const users = (usersSnap.data() && usersSnap.data().users) || [];
   const sojUsers = users.filter((u) => u.actif !== false && Array.isArray(u.fonctions) && u.fonctions.includes("SOJ_CDG"));
@@ -117,7 +112,10 @@ async function main() {
   const checksSnap = await db.collection("checks").where("date", ">=", startOfDayIso).get();
   const checksToday = checksSnap.docs.map((d) => d.data()).filter((c) => localDateKeyOf(c.date) === now.dayKey);
 
-  const result = computeShouldNotify({ now, horaires, vehicles, checksToday });
+  const missedSnap = await db.collection("missed_checks").where("dayKey", "==", now.dayKey).get();
+  const missedToday = missedSnap.docs.map((d) => d.data());
+
+  const result = computeShouldNotify({ now, horaires, vehicles, checksToday, missedToday });
   if (!result.shouldNotify) {
     console.log("Rien à signaler pour l'instant.");
     return;
