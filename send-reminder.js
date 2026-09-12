@@ -1,12 +1,13 @@
 // Rappel programmé (GitHub Actions) pour l'application Inventaire CIS Saint-Raphaël.
-// Vérifie, comme le bandeau dans l'application, si le SOJ/Chef de Garde doit être prévenu
-// (problème matériel non pris en compte, inventaire du matin ou du soir non fait) — et
-// envoie une notification push, une seule fois par jour, si c'est le cas.
+// Vérifie, comme les bandeaux dans l'application, si quelqu'un doit être prévenu (problème
+// matériel non pris en compte, inventaire du matin ou du soir non fait, point AMSEC en NON
+// non traité, ou contrôle AMSEC pas encore fait) — et envoie une notification push, une seule
+// fois par jour, si c'est le cas.
 // N'écrit rien dans le Journal ni ailleurs à part la marque "déjà envoyé aujourd'hui".
 
 const admin = require("firebase-admin");
 
-const DEFAULT_HORAIRES = { bandeau: "17:00", soirDebut: "19:45", traceMatin: "19:30", traceSoir: "21:00" };
+const DEFAULT_HORAIRES = { bandeau: "17:00", soirDebut: "19:45", traceMatin: "19:30", traceSoir: "21:00", alerteAmsec: "10:00" };
 
 function parseHM(str) {
   const m = /^(\d{1,2}):(\d{2})$/.exec(str || "");
@@ -58,26 +59,39 @@ function isScheduledToday(vehicle, weekday) {
   return Array.isArray(vehicle.joursControle) && vehicle.joursControle.includes(weekday);
 }
 
-// Calcule s'il faut prévenir, à partir des mêmes données que le bandeau dans l'application.
+// Calcule s'il faut prévenir, à partir des mêmes données que les bandeaux dans l'application.
 // Fonction pure (aucun accès réseau) pour pouvoir être testée facilement.
-function computeShouldNotify({ now, horaires, vehicles, checksToday, missedToday }) {
-  if (!isAtOrAfter(now, horaires.bandeau, 17, 0)) return { shouldNotify: false, reason: "avant l'heure du bandeau" };
+// Un point AMSEC en NON non traité est signalé sans attendre l'heure du bandeau (17h) : c'est
+// une anomalie de sécurité, pas une simple relance de fin de journée.
+function computeShouldNotify({ now, horaires, vehicles, checksToday, missedToday, amsecChecksToday, saisonFDF }) {
+  const pastBandeau = isAtOrAfter(now, horaires.bandeau, 17, 0);
+  const pastAmsecAlert = isAtOrAfter(now, horaires.alerteAmsec, 10, 0);
 
-  const hasUnvalidatedProblemsToday = checksToday.some((c) =>
+  const hasUnvalidatedProblemsToday = pastBandeau && checksToday.some((c) =>
     Object.values(c.results || {}).some((r) => (r.manquant || r.deteriore) && !r.validated)
   );
-  const hasUnvalidatedMissedToday = (missedToday || []).some((m) => !m.validated);
-  const hasPendingDayInventory = vehicles.some((v) =>
+  const hasUnvalidatedMissedToday = pastBandeau && (missedToday || []).some((m) => !m.validated);
+  const hasPendingDayInventory = pastBandeau && vehicles.some((v) =>
     isScheduledToday(v, now.weekday) && !v.indisponible &&
     !checksToday.some((c) => c.vehicleId === v.id)
   );
-  const hasPendingEveningInventory = vehicles.some((v) =>
+  const hasPendingEveningInventory = pastBandeau && vehicles.some((v) =>
     v.soirInventaire && !v.indisponible &&
     !checksToday.some((c) => c.vehicleId === v.id && isEveningCheckIso(c.date, horaires))
   );
+  const hasUnvalidatedAmsecToday = (amsecChecksToday || []).some((c) =>
+    Object.values(c.results || {}).some((r) => r.value === "non" && !r.validated)
+  );
+  const hasPendingAmsecToday = !!saisonFDF && pastAmsecAlert && vehicles.some((v) =>
+    v.amsecFiche && !v.indisponible && !(amsecChecksToday || []).some((c) => c.vehicleId === v.id)
+  );
 
-  const shouldNotify = hasUnvalidatedProblemsToday || hasUnvalidatedMissedToday || hasPendingDayInventory || hasPendingEveningInventory;
-  return { shouldNotify, hasUnvalidatedProblemsToday, hasUnvalidatedMissedToday, hasPendingDayInventory, hasPendingEveningInventory };
+  const shouldNotify = hasUnvalidatedProblemsToday || hasUnvalidatedMissedToday || hasPendingDayInventory ||
+    hasPendingEveningInventory || hasUnvalidatedAmsecToday || hasPendingAmsecToday;
+  return {
+    shouldNotify, hasUnvalidatedProblemsToday, hasUnvalidatedMissedToday,
+    hasPendingDayInventory, hasPendingEveningInventory, hasUnvalidatedAmsecToday, hasPendingAmsecToday,
+  };
 }
 
 async function main() {
@@ -91,17 +105,17 @@ async function main() {
   const settingsSnap = await db.collection("caserne").doc("settings").get();
   const settingsData = settingsSnap.data() || {};
   const horaires = { ...DEFAULT_HORAIRES, ...(settingsData.horaires || {}) };
-
-  if (!isAtOrAfter(now, horaires.bandeau, 17, 0)) {
-    console.log("Avant l'heure du bandeau, rien à faire.");
-    return;
-  }
+  const saisonFDF = !!settingsData.saisonFDF;
 
   const usersSnap = await db.collection("caserne").doc("users").get();
   const users = (usersSnap.data() && usersSnap.data().users) || [];
-  const sojUsers = users.filter((u) => u.actif !== false && Array.isArray(u.fonctions) && u.fonctions.includes("SOJ_CDG"));
-  if (sojUsers.length === 0) {
-    console.log("Aucun compte SOJ/Chef de Garde, rien à envoyer.");
+  // Destinataires : la fonction SOJ/Chef de Garde, et systématiquement l'Administration (au même
+  // titre que le bandeau dans l'application, qu'elle voit toujours quelle que soit sa fonction).
+  const recipientUsers = users.filter((u) => u.actif !== false && (
+    (Array.isArray(u.fonctions) && u.fonctions.includes("SOJ_CDG")) || u.role === "administration"
+  ));
+  if (recipientUsers.length === 0) {
+    console.log("Aucun compte SOJ/Chef de Garde ou Administration, rien à envoyer.");
     return;
   }
 
@@ -115,7 +129,10 @@ async function main() {
   const missedSnap = await db.collection("missed_checks").where("dayKey", "==", now.dayKey).get();
   const missedToday = missedSnap.docs.map((d) => d.data());
 
-  const result = computeShouldNotify({ now, horaires, vehicles, checksToday, missedToday });
+  const amsecSnap = await db.collection("amsec_checks").where("date", ">=", startOfDayIso).get();
+  const amsecChecksToday = amsecSnap.docs.map((d) => d.data()).filter((c) => localDateKeyOf(c.date) === now.dayKey);
+
+  const result = computeShouldNotify({ now, horaires, vehicles, checksToday, missedToday, amsecChecksToday, saisonFDF });
   if (!result.shouldNotify) {
     console.log("Rien à signaler pour l'instant.");
     return;
@@ -130,19 +147,23 @@ async function main() {
     return;
   }
 
-  const uidSet = new Set(sojUsers.map((u) => u.uid));
+  const uidSet = new Set(recipientUsers.map((u) => u.uid));
   const tokensSnap = await db.collection("fcm_tokens").get();
   const tokens = tokensSnap.docs.filter((d) => uidSet.has(d.data().uid)).map((d) => d.data().token).filter(Boolean);
 
   if (tokens.length === 0) {
-    console.log("Aucun compte SOJ/Chef de Garde n'a activé les notifications pour l'instant.");
+    console.log("Personne n'a activé les notifications pour l'instant.");
     return;
   }
+
+  const body = (result.hasUnvalidatedAmsecToday || result.hasPendingAmsecToday)
+    ? "AMSEC : un point signalé en NON reste à traiter, ou un contrôle AMSEC n'a pas encore été fait."
+    : "Des problèmes ou inventaires du jour restent à prendre en compte.";
 
   const message = {
     notification: {
       title: settingsData.appName || "Inventaire CIS Saint-Raphaël",
-      body: "Des problèmes ou inventaires du jour restent à prendre en compte.",
+      body,
     },
     data: { url: "./" },
     tokens,
