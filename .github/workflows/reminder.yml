@@ -2,8 +2,11 @@ name: Rappel SOJ/CDG (notifications push)
 
 on:
   schedule:
+    # Toutes les 15 minutes. GitHub n'exécute pas forcément pile à l'heure (quelques
+    # minutes de retard possibles aux heures de forte charge) — le script lui-même
+    # vérifie l'heure exacte et ne fait rien avant l'heure du bandeau (17h par défaut).
     - cron: "*/15 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch: {} # permet de le lancer manuellement depuis l'onglet "Actions", pour tester
 
 jobs:
   reminder:
