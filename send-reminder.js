@@ -3,11 +3,15 @@
 // matériel non pris en compte, inventaire du matin ou du soir non fait, point AMSEC en NON
 // non traité, ou contrôle AMSEC pas encore fait) — et envoie une notification push, une seule
 // fois par jour, si c'est le cas.
-// N'écrit rien dans le Journal ni ailleurs à part la marque "déjà envoyé aujourd'hui".
+// Vérifie aussi, séparément et sans cette limite d'une fois par jour, si une demande d'accès
+// (« Première connexion ») attend d'être validée — et prévient alors l'Administration
+// immédiatement à la première détection, puis en rappel toutes les heures tant qu'elle traîne.
+// N'écrit rien dans le Journal ni ailleurs à part les marques de suivi de ces deux envois.
 
 const admin = require("firebase-admin");
 
 const DEFAULT_HORAIRES = { bandeau: "17:00", soirDebut: "19:45", traceMatin: "19:30", traceSoir: "21:00", alerteAmsec: "10:00" };
+const PENDING_USERS_REMINDER_INTERVAL_MS = 60 * 60 * 1000; // 1h
 
 function parseHM(str) {
   const m = /^(\d{1,2}):(\d{2})$/.exec(str || "");
@@ -94,6 +98,38 @@ function computeShouldNotify({ now, horaires, vehicles, checksToday, missedToday
   };
 }
 
+// Calcule s'il faut prévenir l'Administration pour des demandes d'accès en attente. Fonction
+// pure (aucun accès réseau), indépendante de computeShouldNotify : ni sa limite d'une fois par
+// jour, ni ses destinataires (celle-ci ne concerne que l'Administration) ne s'appliquent ici.
+// Se déclenche dès qu'une demande n'a encore jamais été signalée (nouvelle arrivée), ou que le
+// dernier rappel remonte à plus d'une heure alors qu'au moins une demande traîne toujours.
+function computePendingUsersNotification({ nowMs, pending, lastReminderAtIso, reminderIntervalMs }) {
+  if (!pending || pending.length === 0) return { shouldNotify: false, newIds: [], body: null };
+  const newOnes = pending.filter((p) => !p.notifiedAt);
+  const lastReminderAt = lastReminderAtIso ? new Date(lastReminderAtIso).getTime() : 0;
+  const intervalPassed = (nowMs - lastReminderAt) >= (reminderIntervalMs || PENDING_USERS_REMINDER_INTERVAL_MS);
+  const shouldNotify = newOnes.length > 0 || intervalPassed;
+  if (!shouldNotify) return { shouldNotify: false, newIds: [], body: null };
+  const body = pending.length === 1
+    ? `Une demande d'accès attend d'être validée : ${pending[0].name || "un agent"}.`
+    : `${pending.length} demandes d'accès attendent d'être validées.`;
+  return { shouldNotify: true, newIds: newOnes.map((p) => p.id), body };
+}
+
+async function sendPush(db, { tokens, title, body }) {
+  if (tokens.length === 0) return { successCount: 0, failureCount: 0 };
+  const message = { notification: { title, body }, data: { url: "./" }, tokens };
+  const response = await admin.messaging().sendEachForMulticast(message);
+  console.log(`Notifications envoyées (${body}) : ${response.successCount} réussie(s), ${response.failureCount} échouée(s).`);
+  return response;
+}
+
+async function tokensForUsers(db, users) {
+  const uidSet = new Set(users.map((u) => u.uid));
+  const tokensSnap = await db.collection("fcm_tokens").get();
+  return tokensSnap.docs.filter((d) => uidSet.has(d.data().uid)).map((d) => d.data().token).filter(Boolean);
+}
+
 async function main() {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
   if (!raw) throw new Error("La variable d'environnement FIREBASE_SERVICE_ACCOUNT est manquante.");
@@ -101,21 +137,56 @@ async function main() {
   const db = admin.firestore();
 
   const now = parisNow();
+  const nowMs = Date.now();
 
   const settingsSnap = await db.collection("caserne").doc("settings").get();
   const settingsData = settingsSnap.data() || {};
   const horaires = { ...DEFAULT_HORAIRES, ...(settingsData.horaires || {}) };
   const saisonFDF = !!settingsData.saisonFDF;
+  const appName = settingsData.appName || "Inventaire CIS Saint-Raphaël";
 
   const usersSnap = await db.collection("caserne").doc("users").get();
   const users = (usersSnap.data() && usersSnap.data().users) || [];
+
+  // --- Volet 1 : demandes d'accès en attente (Administration uniquement, sans limite de fréquence) ---
+  const adminUsers = users.filter((u) => u.actif !== false && u.role === "administration");
+  if (adminUsers.length === 0) {
+    console.log("Aucun compte Administration, rien à envoyer pour les demandes d'accès.");
+  } else {
+    const pendingSnap = await db.collection("pending_users").get();
+    const pending = pendingSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const reminderStateRef = db.collection("caserne").doc("pendingUsersReminderState");
+    const reminderStateSnap = await reminderStateRef.get();
+    const reminderState = reminderStateSnap.data() || {};
+
+    const pendingResult = computePendingUsersNotification({
+      nowMs, pending, lastReminderAtIso: reminderState.lastReminderAt,
+    });
+
+    if (pendingResult.shouldNotify) {
+      const adminTokens = await tokensForUsers(db, adminUsers);
+      await sendPush(db, { tokens: adminTokens, title: appName, body: pendingResult.body });
+      // Marque toutes les demandes actuellement en attente comme déjà signalées au moins une
+      // fois, et note l'heure de ce rappel pour cadencer le suivant.
+      const batch = db.batch();
+      pending.forEach((p) => {
+        if (!p.notifiedAt) batch.update(db.collection("pending_users").doc(p.id), { notifiedAt: new Date().toISOString() });
+      });
+      batch.set(reminderStateRef, { lastReminderAt: new Date().toISOString() });
+      await batch.commit();
+    } else {
+      console.log(pending.length === 0 ? "Aucune demande d'accès en attente." : "Demande(s) d'accès déjà signalée(s) récemment.");
+    }
+  }
+
+  // --- Volet 2 : problèmes/inventaires/AMSEC du jour (SOJ/Chef de Garde + Administration, une fois par jour) ---
   // Destinataires : la fonction SOJ/Chef de Garde, et systématiquement l'Administration (au même
   // titre que le bandeau dans l'application, qu'elle voit toujours quelle que soit sa fonction).
   const recipientUsers = users.filter((u) => u.actif !== false && (
     (Array.isArray(u.fonctions) && u.fonctions.includes("SOJ_CDG")) || u.role === "administration"
   ));
   if (recipientUsers.length === 0) {
-    console.log("Aucun compte SOJ/Chef de Garde ou Administration, rien à envoyer.");
+    console.log("Aucun compte SOJ/Chef de Garde ou Administration, rien à envoyer pour les problèmes du jour.");
     return;
   }
 
@@ -134,24 +205,21 @@ async function main() {
 
   const result = computeShouldNotify({ now, horaires, vehicles, checksToday, missedToday, amsecChecksToday, saisonFDF });
   if (!result.shouldNotify) {
-    console.log("Rien à signaler pour l'instant.");
+    console.log("Rien à signaler pour l'instant côté problèmes/inventaires/AMSEC.");
     return;
   }
 
-  // Une seule notification par jour, même si cette tâche s'exécute toutes les 15 minutes.
+  // Une seule notification par jour pour ce volet, même si cette tâche s'exécute toutes les 15 minutes.
   const pushStateRef = db.collection("caserne").doc("pushState");
   const pushStateSnap = await pushStateRef.get();
   const pushState = pushStateSnap.data() || {};
   if (pushState.dayKey === now.dayKey && pushState.sent) {
-    console.log("Déjà envoyé aujourd'hui.");
+    console.log("Déjà envoyé aujourd'hui pour ce volet.");
     return;
   }
 
-  const uidSet = new Set(recipientUsers.map((u) => u.uid));
-  const tokensSnap = await db.collection("fcm_tokens").get();
-  const tokens = tokensSnap.docs.filter((d) => uidSet.has(d.data().uid)).map((d) => d.data().token).filter(Boolean);
-
-  if (tokens.length === 0) {
+  const recipientTokens = await tokensForUsers(db, recipientUsers);
+  if (recipientTokens.length === 0) {
     console.log("Personne n'a activé les notifications pour l'instant.");
     return;
   }
@@ -160,22 +228,14 @@ async function main() {
     ? "AMSEC : un point signalé en NON reste à traiter, ou un contrôle AMSEC n'a pas encore été fait."
     : "Des problèmes ou inventaires du jour restent à prendre en compte.";
 
-  const message = {
-    notification: {
-      title: settingsData.appName || "Inventaire CIS Saint-Raphaël",
-      body,
-    },
-    data: { url: "./" },
-    tokens,
-  };
-
-  const response = await admin.messaging().sendEachForMulticast(message);
-  console.log(`Notifications envoyées : ${response.successCount} réussie(s), ${response.failureCount} échouée(s).`);
-
+  await sendPush(db, { tokens: recipientTokens, title: appName, body });
   await pushStateRef.set({ dayKey: now.dayKey, sent: true, sentAt: new Date().toISOString() });
 }
 
-module.exports = { parisNow, isAtOrAfter, localDateKeyOf, isEveningCheckIso, isScheduledToday, computeShouldNotify };
+module.exports = {
+  parisNow, isAtOrAfter, localDateKeyOf, isEveningCheckIso, isScheduledToday,
+  computeShouldNotify, computePendingUsersNotification,
+};
 
 if (require.main === module) {
   main().catch((err) => {
